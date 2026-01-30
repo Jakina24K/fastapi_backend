@@ -1,142 +1,204 @@
+"""
+Service NLP : gestion du chargement et de l'inférence du modèle
+"""
+import json
 import joblib
-import numpy as np
-import pandas as pd
 from pathlib import Path
-from fastapi import HTTPException
-import traceback
+from typing import Dict, Optional, Union
+import logging
+import numpy as np
 
-model_path = Path(__file__).parent.parent / "models" / "spam_detect_model.pkl"
+logger = logging.getLogger(__name__)
 
-# Charger le modèle
-try:
-    model = joblib.load(model_path)
-    print(f"✅ Modèle chargé depuis: {model_path}")
-    print(f"Type du modèle: {type(model)}")
+
+class NLPService:
+    """Service pour charger et utiliser le modèle de classification spam/ham"""
     
-    # Afficher la structure du pipeline pour debug
-    if hasattr(model, 'named_steps'):
-        print(f"Étapes du pipeline: {list(model.named_steps.keys())}")
-except Exception as e:
-    print(f"❌ Erreur lors du chargement du modèle: {e}")
-    raise
-
-def predict(text: str):
-    """
-    Prédit si un texte est spam ou ham.
+    def __init__(self):
+        self.model = None
+        self.accuracy: Optional[float] = None
+        self.classes_: Optional[np.ndarray] = None
+        self.model_path = Path(__file__).parent.parent / "models" / "spam_pipeline_fr_nb.joblib"
+        self.metrics_path = Path(__file__).parent.parent / "models" / "metrics.json"
     
-    Args:
-        text: Le texte SMS à analyser
+    def load_model(self) -> None:
+        """
+        Charge le modèle joblib et les métriques au démarrage
         
-    Returns:
-        dict: Dictionnaire contenant la prédiction et les probabilités
-    """
-    try:
-        print(f"📝 Texte reçu: {text}")
-        
-        # MÉTHODE 1: Utiliser pandas Series (recommandé pour les pipelines sklearn)
+        Raises:
+            FileNotFoundError: Si le modèle ou les métriques sont introuvables
+            Exception: Si le chargement échoue
+        """
         try:
-            text_input = pd.Series([text])
-            print(f"✓ Méthode 1 - pandas Series: {type(text_input)}, shape: {text_input.shape}")
-            prediction = model.predict(text_input)[0]
-            probabilities = model.predict_proba(text_input)[0]
-            print(f"✅ Prédiction réussie avec pandas Series")
-        except Exception as e1:
-            print(f"⚠️ Méthode 1 échouée: {e1}")
+            # Vérification de l'existence des fichiers
+            if not self.model_path.exists():
+                raise FileNotFoundError(
+                    f"Modèle introuvable : {self.model_path.absolute()}"
+                )
             
-            # MÉTHODE 2: Utiliser une liste simple
-            try:
-                text_input = [text]
-                print(f"✓ Méthode 2 - Liste: {type(text_input)}")
-                prediction = model.predict(text_input)[0]
-                probabilities = model.predict_proba(text_input)[0]
-                print(f"✅ Prédiction réussie avec liste")
-            except Exception as e2:
-                print(f"⚠️ Méthode 2 échouée: {e2}")
+            if not self.metrics_path.exists():
+                raise FileNotFoundError(
+                    f"Fichier metrics.json introuvable : {self.metrics_path.absolute()}"
+                )
+            
+            # Chargement du modèle
+            logger.info(f"Chargement du modèle depuis {self.model_path}")
+            self.model = joblib.load(self.model_path)
+            logger.info("✓ Modèle chargé avec succès")
+            
+            # Récupération des classes
+            if hasattr(self.model, 'classes_'):
+                self.classes_ = self.model.classes_
+                logger.info(f"✓ Classes du modèle : {self.classes_}")
+                logger.info(f"✓ Type des classes : {type(self.classes_[0])}")
+            else:
+                logger.warning("⚠️  Le modèle n'a pas d'attribut 'classes_'")
+            
+            # Chargement de l'accuracy
+            with open(self.metrics_path, 'r', encoding='utf-8') as f:
+                metrics = json.load(f)
+                self.accuracy = metrics.get("accuracy")
                 
-                # MÉTHODE 3: Utiliser numpy array avec reshape
-                try:
-                    text_input = np.array([text]).reshape(-1, 1)
-                    print(f"✓ Méthode 3 - NumPy array: {type(text_input)}, shape: {text_input.shape}")
-                    prediction = model.predict(text_input)[0]
-                    probabilities = model.predict_proba(text_input)[0]
-                    print(f"✅ Prédiction réussie avec numpy array")
-                except Exception as e3:
-                    print(f"⚠️ Méthode 3 échouée: {e3}")
+            if self.accuracy is None:
+                logger.warning("Accuracy non trouvée dans metrics.json")
+            else:
+                logger.info(f"✓ Accuracy chargée : {self.accuracy:.4f}")
+                
+        except Exception as e:
+            logger.error(f"Erreur lors du chargement du modèle : {e}")
+            raise
+    
+    def predict(self, text: str) -> Dict[str, any]:
+        """
+        Effectue une prédiction sur un texte donné
+        
+        Args:
+            text: Le texte à classifier
+            
+        Returns:
+            Dict contenant:
+                - label: "spam" ou "ham"
+                - accuracy: précision du modèle
+                - probabilities: dict avec proba spam/ham
+                - confidence: probabilité de la classe prédite
+                - raw_prediction: prédiction brute du modèle
+                
+        Raises:
+            ValueError: Si le texte est vide ou le modèle non chargé
+        """
+        # Validation
+        if not text or not text.strip():
+            raise ValueError("Le texte ne peut pas être vide")
+        
+        if self.model is None:
+            raise ValueError("Le modèle n'est pas chargé")
+        
+        # Prédiction brute
+        raw_prediction = self.model.predict([text])[0]
+        
+        # Initialisation des variables
+        label = None
+        probabilities = None
+        confidence = None
+        
+        # Calcul des probabilités
+        if hasattr(self.model, 'predict_proba'):
+            try:
+                probas = self.model.predict_proba([text])[0]
+                
+                # ✅ GESTION DES CLASSES STRING OU INT
+                if self.classes_ is not None:
+                    # Créer un mapping classe -> probabilité
+                    class_proba_map = {}
                     
-                    # MÉTHODE 4: Utiliser DataFrame
-                    try:
-                        text_input = pd.DataFrame({'text': [text]})
-                        print(f"✓ Méthode 4 - DataFrame: {type(text_input)}, shape: {text_input.shape}")
-                        # Essayer avec la colonne 'text'
-                        prediction = model.predict(text_input['text'])[0]
-                        probabilities = model.predict_proba(text_input['text'])[0]
-                        print(f"✅ Prédiction réussie avec DataFrame")
-                    except Exception as e4:
-                        print(f"❌ Toutes les méthodes ont échoué!")
-                        print(f"Erreur finale: {e4}")
-                        raise e4
+                    for i, cls in enumerate(self.classes_):
+                        # Convertir la classe en string si nécessaire
+                        class_key = str(cls).lower()
+                        class_proba_map[class_key] = float(probas[i])
+                    
+                    logger.debug(f"Mapping classes->probas : {class_proba_map}")
+                    
+                    # Extraire les probabilités ham/spam
+                    ham_proba = class_proba_map.get('ham', 0.0)
+                    spam_proba = class_proba_map.get('spam', 0.0)
+                    
+                    # Si les clés ne correspondent pas, essayer avec '0' et '1'
+                    if ham_proba == 0.0 and spam_proba == 0.0:
+                        ham_proba = class_proba_map.get('0', probas[0])
+                        spam_proba = class_proba_map.get('1', probas[1])
+                    
+                    probabilities = {
+                        "ham": ham_proba,
+                        "spam": spam_proba
+                    }
+                    
+                    # ✅ Déterminer le label par la plus haute probabilité
+                    if spam_proba > ham_proba:
+                        label = "spam"
+                        confidence = spam_proba
+                    else:
+                        label = "ham"
+                        confidence = ham_proba
+                    
+                    logger.info(
+                        f"Prédiction : Ham={ham_proba:.4f}, Spam={spam_proba:.4f} "
+                        f"-> Label={label} (confiance={confidence:.4f})"
+                    )
+                    
+                else:
+                    # Fallback si classes_ n'est pas disponible
+                    probabilities = {
+                        "ham": float(probas[0]),
+                        "spam": float(probas[1])
+                    }
+                    label = "spam" if probas[1] > probas[0] else "ham"
+                    confidence = float(max(probas))
+                    
+            except Exception as e:
+                logger.error(f"Erreur lors du calcul des probabilités : {e}", exc_info=True)
+                # Fallback sur la prédiction brute
+                label = str(raw_prediction).lower()
+                if label not in ['ham', 'spam']:
+                    label = "spam" if raw_prediction == 1 else "ham"
+        else:
+            # Pas de predict_proba disponible
+            label = str(raw_prediction).lower()
+            if label not in ['ham', 'spam']:
+                label = "spam" if raw_prediction == 1 else "ham"
         
-        # Formatage de la réponse
-        is_spam = bool(prediction == 1)
-        label = 'spam' if is_spam else 'ham'
-        confidence = float(probabilities[prediction])
-        
+        # Construction du résultat
         result = {
-            "text": text,
-            "prediction": label,
-            "is_spam": is_spam,
+            "label": label,
+            "accuracy": self.accuracy,
             "confidence": confidence,
-            "probabilities": {
-                'ham': float(probabilities[0]),
-                'spam': float(probabilities[1])
-            }
+            "raw_prediction": str(raw_prediction)
         }
         
-        print(f"📊 Résultat: {label} (confiance: {confidence:.2%})")
+        if probabilities:
+            result["probabilities"] = probabilities
+        
         return result
+    
+    def get_model_info(self) -> Dict[str, any]:
+        """
+        Retourne les informations sur le modèle chargé
         
-    except Exception as e:
-        # Afficher la trace complète pour debug
-        error_trace = traceback.format_exc()
-        print(f"❌ ERREUR DÉTAILLÉE:\n{error_trace}")
+        Returns:
+            Dict avec les métadonnées du modèle
+        """
+        classes_info = None
+        if self.classes_ is not None:
+            classes_info = [str(c) for c in self.classes_]
         
-        # Retourner une erreur HTTP avec détails
-        raise HTTPException(
-            status_code=500, 
-            detail={
-                "error": "Erreur lors de la prédiction",
-                "message": str(e),
-                "type": type(e).__name__
-            }
-        )
+        return {
+            "model_loaded": self.model is not None,
+            "accuracy": self.accuracy,
+            "model_path": str(self.model_path),
+            "model_type": str(type(self.model).__name__) if self.model else None,
+            "classes": classes_info,
+            "classes_type": str(type(self.classes_[0])) if self.classes_ is not None and len(self.classes_) > 0 else None
+        }
 
 
-def test_model():
-    """
-    Fonction de test pour vérifier que le modèle fonctionne.
-    À appeler au démarrage de l'application.
-    """
-    test_messages = [
-        "Félicitations! Vous avez gagné 1000€!",
-        "Salut, on se voit ce soir?",
-    ]
-    
-    print("\n" + "="*60)
-    print("🧪 TEST DU MODÈLE")
-    print("="*60)
-    
-    for msg in test_messages:
-        try:
-            result = predict(msg)
-            print(f"\n✓ Message: {msg}")
-            print(f"  Prédiction: {result['prediction']} ({result['confidence']:.2%})")
-        except Exception as e:
-            print(f"\n✗ Erreur pour: {msg}")
-            print(f"  {e}")
-    
-    print("\n" + "="*60 + "\n")
-
-
-# Tester le modèle au chargement du module
-if __name__ == "__main__":
-    test_model()
+# Instance singleton du service
+nlp_service = NLPService()
